@@ -1,612 +1,1807 @@
-import json
-import math
 import os
+import json
 import sqlite3
 import threading
 import time
-import tkinter as tk
-from datetime import datetime, time as dtime
-from pathlib import Path
-from tkinter import messagebox, ttk
+from datetime import datetime, date
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
-import numpy as np
-import pandas as pd
-import requests
-import yfinance as yf
-from dotenv import load_dotenv
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
 
 try:
-    import tkinter.font as tkfont
+    import yfinance as yf
 except Exception:
-    tkfont = None
+    yf = None
 
-BASE = Path(__file__).resolve().parent
-DB = BASE / "stock_assistant.db"
-ENV = BASE / ".env"
+try:
+    import requests
+except Exception:
+    requests = None
 
-load_dotenv(ENV)
-
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
-DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "15:35")
-BUY_SCORE = int(os.getenv("BUY_SCORE", "3"))
-SELL_SCORE = int(os.getenv("SELL_SCORE", "3"))
-
-
-def db():
-    con = sqlite3.connect(DB)
-    con.row_factory = sqlite3.Row
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS stocks(
-            code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            shares INTEGER NOT NULL DEFAULT 0,
-            avg_cost REAL NOT NULL DEFAULT 0,
-            buy_target REAL,
-            sell_target REAL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            last_price REAL,
-            last_alert TEXT,
-            last_alert_at TEXT
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS purchases(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL,
-            shares INTEGER NOT NULL,
-            price REAL NOT NULL,
-            purchased_at TEXT NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL,
-            captured_at TEXT NOT NULL,
-            price REAL NOT NULL,
-            value REAL,
-            profit REAL
-        )
-    """)
-    con.commit()
-    return con
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 
-def money(v):
-    if v is None:
-        return "-"
-    return f"{v:,.0f}円"
+DB_FILE = "stocks.db"
 
 
-def pct(v):
-    return f"{v:+.2f}%"
+def normalize_ticker(code: str) -> str:
+    """
+    日本株コードをYahoo Finance形式に変換する。
+    7203 → 7203.T
+    7203.T → 7203.T
+    """
+    code = str(code).strip().upper()
 
+    if code.isdigit() and len(code) in (4, 5):
+        return f"{code}.T"
 
-def calc_average(rows):
-    total_shares = sum(int(r["shares"]) for r in rows)
-    total_cost = sum(int(r["shares"]) * float(r["price"]) for r in rows)
-    return total_shares, (total_cost / total_shares if total_shares else 0)
+    if code.endswith(".T"):
+        return code
 
-
-def add_purchase(code, name, shares, price, buy_target, sell_target):
-    con = db()
-    now = datetime.now().isoformat(timespec="seconds")
-    con.execute(
-        "INSERT INTO purchases(code,shares,price,purchased_at) VALUES(?,?,?,?)",
-        (code, shares, price, now)
-    )
-    rows = con.execute(
-        "SELECT shares, price FROM purchases WHERE code=?", (code,)
-    ).fetchall()
-    total_shares, avg = calc_average(rows)
-
-    con.execute("""
-        INSERT INTO stocks(code,name,shares,avg_cost,buy_target,sell_target)
-        VALUES(?,?,?,?,?,?)
-        ON CONFLICT(code) DO UPDATE SET
-          name=excluded.name,
-          shares=excluded.shares,
-          avg_cost=excluded.avg_cost,
-          buy_target=COALESCE(excluded.buy_target, stocks.buy_target),
-          sell_target=COALESCE(excluded.sell_target, stocks.sell_target),
-          enabled=1
-    """, (code, name, total_shares, avg, buy_target, sell_target))
-    con.commit()
-    con.close()
-
-
-def get_stocks():
-    con = db()
-    rows = con.execute("SELECT * FROM stocks WHERE enabled=1 ORDER BY code").fetchall()
-    con.close()
-    return rows
-
-
-def get_purchases(code):
-    con = db()
-    rows = con.execute(
-        "SELECT shares,price,purchased_at FROM purchases WHERE code=? ORDER BY purchased_at",
-        (code,)
-    ).fetchall()
-    con.close()
-    return rows
-
-
-def save_price(code, price):
-    con = db()
-    row = con.execute("SELECT shares,avg_cost FROM stocks WHERE code=?", (code,)).fetchone()
-    if row:
-        value = float(price) * row["shares"]
-        profit = value - float(row["avg_cost"]) * row["shares"]
-        con.execute(
-            "UPDATE stocks SET last_price=? WHERE code=?", (price, code)
-        )
-        con.execute("""
-            INSERT INTO snapshots(code,captured_at,price,value,profit)
-            VALUES(?,?,?,?,?)
-        """, (code, datetime.now().isoformat(timespec="seconds"), price, value, profit))
-        con.commit()
-    con.close()
+    return code
 
 
 class PriceProvider:
-    def price(self, code):
-        """Yahoo Finance fallback. 日本株は .T を付与。"""
-        ticker = code if "." in code else f"{code}.T"
-        t = yf.Ticker(ticker)
-        try:
-            fi = t.fast_info
-            p = fi.get("last_price")
-            if p and not (isinstance(p, float) and math.isnan(p)):
-                return float(p)
-        except Exception:
-            pass
-        hist = t.history(period="1d", interval="1m", auto_adjust=False)
-        if hist is None or hist.empty:
-            raise RuntimeError(f"{code}: 株価を取得できませんでした")
-        return float(hist["Close"].dropna().iloc[-1])
+    """
+    株価取得クラス。
 
-    def history(self, code):
-        ticker = code if "." in code else f"{code}.T"
-        return yf.Ticker(ticker).history(period="3mo", interval="1d", auto_adjust=False)
+    1. yfinance
+    2. Yahoo Finance Chart API
+    の順番で取得する。
+    """
 
-    def news(self, code):
-        ticker = code if "." in code else f"{code}.T"
-        try:
-            data = yf.Ticker(ticker).news
-            result = []
-            for item in data[:5]:
-                content = item.get("content", item)
-                title = content.get("title") or item.get("title")
-                link = content.get("canonicalUrl", {}).get("url") or item.get("link")
-                if title:
-                    result.append((title, link))
-            return result
-        except Exception:
-            return []
-
-
-provider = PriceProvider()
-
-
-def indicators(code):
-    h = provider.history(code)
-    if h is None or len(h) < 30:
-        return None
-
-    close = h["Close"].astype(float)
-    volume = h["Volume"].astype(float)
-
-    sma25 = close.rolling(25).mean().iloc[-1]
-    sma5 = close.rolling(5).mean().iloc[-1]
-
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = float((100 - (100 / (1 + rs))).iloc[-1])
-    if math.isnan(rsi):
-        rsi = 50.0
-
-    last = float(close.iloc[-1])
-    prev = float(close.iloc[-2])
-    change = (last / prev - 1) * 100 if prev else 0
-
-    avg_volume = float(volume.rolling(20).mean().iloc[-1])
-    today_volume = float(volume.iloc[-1])
-    volume_ratio = today_volume / avg_volume if avg_volume else 1
-
-    return {
-        "price": last,
-        "sma5": float(sma5),
-        "sma25": float(sma25),
-        "rsi": rsi,
-        "change": change,
-        "volume_ratio": volume_ratio,
-    }
-
-
-def signal_for(stock, ind):
-    if not ind:
-        return {"signal": "データ不足", "score": 0, "reasons": []}
-
-    price = ind["price"]
-    reasons_buy = []
-    reasons_sell = []
-    buy = sell = 0
-
-    if stock["buy_target"] is not None and price <= stock["buy_target"]:
-        buy += 2
-        reasons_buy.append("設定した買い目標価格以下")
-    if stock["sell_target"] is not None and price >= stock["sell_target"]:
-        sell += 2
-        reasons_sell.append("設定した売り目標価格以上")
-
-    if ind["rsi"] <= 30:
-        buy += 2
-        reasons_buy.append(f"RSI {ind['rsi']:.1f}で売られすぎ傾向")
-    elif ind["rsi"] >= 70:
-        sell += 2
-        reasons_sell.append(f"RSI {ind['rsi']:.1f}で買われすぎ傾向")
-
-    if price < ind["sma25"]:
-        buy += 1
-        reasons_buy.append("25日移動平均線を下回る")
-    elif price > ind["sma25"]:
-        sell += 1
-        reasons_sell.append("25日移動平均線を上回る")
-
-    if ind["sma5"] > ind["sma25"]:
-        buy += 1
-        reasons_buy.append("短期移動平均が上向き")
-    elif ind["sma5"] < ind["sma25"]:
-        sell += 1
-        reasons_sell.append("短期移動平均が弱い")
-
-    if ind["volume_ratio"] >= 1.5:
-        if ind["change"] > 0:
-            buy += 1
-            reasons_buy.append("出来高増加＋上昇")
-        elif ind["change"] < 0:
-            sell += 1
-            reasons_sell.append("出来高増加＋下落")
-
-    if buy >= BUY_SCORE and buy > sell:
-        return {"signal": "🟢 買い候補", "score": buy, "reasons": reasons_buy}
-    if sell >= SELL_SCORE and sell > buy:
-        return {"signal": "🔴 売り候補", "score": sell, "reasons": reasons_sell}
-    return {"signal": "⚪ 様子見", "score": max(buy, sell), "reasons": (reasons_buy if buy >= sell else reasons_sell)}
-
-
-def line_send(text):
-    token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-    user_id = os.getenv("LINE_USER_ID", "").strip()
-    if not token or not user_id:
-        return False, "LINE設定がありません"
-
-    url = "https://api.line.me/v2/bot/message/push"
-    payload = {"to": user_id, "messages": [{"type": "text", "text": text[:5000]}]}
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=15,
-    )
-    if r.ok:
-        return True, "LINE送信成功"
-    return False, f"LINE送信失敗: HTTP {r.status_code} {r.text[:300]}"
-
-
-def desktop_notify(title, message):
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(title, message)
-        root.destroy()
-    except Exception:
-        pass
-
-
-def should_alert(stock, signal_text):
-    old = stock["last_alert"]
-    if old == signal_text:
-        return False
-    return True
-
-
-def mark_alert(code, signal_text):
-    con = db()
-    con.execute(
-        "UPDATE stocks SET last_alert=?,last_alert_at=? WHERE code=?",
-        (signal_text, datetime.now().isoformat(timespec="seconds"), code)
-    )
-    con.commit()
-    con.close()
-
-
-def build_daily_report():
-    stocks = get_stocks()
-    if not stocks:
-        return "本日の保有株レポート\n登録銘柄がありません。"
-
-    lines = ["📊 本日の投資まとめ", datetime.now().strftime("%Y/%m/%d"), ""]
-    total_value = total_cost = 0.0
-    details = []
-
-    for s in stocks:
-        if s["last_price"] is None:
-            continue
-        value = s["last_price"] * s["shares"]
-        cost = s["avg_cost"] * s["shares"]
-        profit = value - cost
-        total_value += value
-        total_cost += cost
-        details.append((s["name"], s["code"], profit, s["last_price"], s["shares"]))
-
-    total_profit = total_value - total_cost
-    total_rate = total_profit / total_cost * 100 if total_cost else 0
-    lines.append(f"評価額合計：{money(total_value)}")
-    lines.append(f"含み損益：{money(total_profit)}（{pct(total_rate)}）")
-    lines.append("")
-
-    if details:
-        best = max(details, key=lambda x: x[2])
-        worst = min(details, key=lambda x: x[2])
-        lines.append(f"利益最大：{best[0]} {money(best[2])}")
-        lines.append(f"損失最大：{worst[0]} {money(worst[2])}")
-        lines.append("")
-        for s in stocks:
-            if s["last_price"] is None:
-                continue
-            ind = indicators(s["code"])
-            sig = signal_for(s, ind)
-            lines.append(f"{sig['signal']} {s['name']}（{s['code']}）")
-            if ind:
-                lines.append(
-                    f"  株価 {money(ind['price'])} / RSI {ind['rsi']:.1f} / 前日比 {pct(ind['change'])}"
-                )
-                if sig["reasons"]:
-                    lines.append("  理由：" + "、".join(sig["reasons"][:3]))
-        lines.append("")
-        lines.append("※シグナルはルールによる候補判定で、利益を保証するものではありません。")
-    else:
-        lines.append("現在価格が取得できた銘柄がありません。")
-
-    return "\n".join(lines)
-
-
-class App(tk.Tk):
     def __init__(self):
-        super().__init__()
-        self.title("STOCK ASSISTANT PRO")
-        self.geometry("1050x700")
-        self.minsize(900, 600)
-        self.monitoring = False
-        self.last_report_date = None
-        self.build_ui()
-        self.refresh()
 
-    def build_ui(self):
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+        if yf is not None:
 
-        top = ttk.Frame(self, padding=12)
-        top.pack(fill="x")
-        ttk.Label(top, text="STOCK ASSISTANT PRO", font=("Yu Gothic UI", 20, "bold")).pack(side="left")
-        self.status = ttk.Label(top, text="停止中")
-        self.status.pack(side="right")
-
-        buttons = ttk.Frame(self, padding=(12, 0, 12, 8))
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="銘柄追加", command=self.add_dialog).pack(side="left", padx=4)
-        ttk.Button(buttons, text="価格更新", command=self.update_prices).pack(side="left", padx=4)
-        ttk.Button(buttons, text="今すぐ分析", command=self.analyze).pack(side="left", padx=4)
-        ttk.Button(buttons, text="今日のまとめ", command=self.show_report).pack(side="left", padx=4)
-        self.monitor_btn = ttk.Button(buttons, text="監視開始", command=self.toggle_monitor)
-        self.monitor_btn.pack(side="left", padx=4)
-
-        self.tree = ttk.Treeview(
-            self,
-            columns=("code", "name", "shares", "avg", "price", "value", "profit", "signal"),
-            show="headings",
-            height=18
-        )
-        heads = [
-            ("code", "コード", 80), ("name", "銘柄", 180), ("shares", "保有", 70),
-            ("avg", "平均取得", 100), ("price", "現在値", 100), ("value", "評価額", 120),
-            ("profit", "損益", 110), ("signal", "判定", 140)
-        ]
-        for c, h, w in heads:
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="center")
-        self.tree.pack(fill="both", expand=True, padx=12, pady=8)
-
-        bottom = ttk.Frame(self, padding=12)
-        bottom.pack(fill="x")
-        self.summary = ttk.Label(bottom, text="", justify="left")
-        self.summary.pack(side="left")
-        self.log = tk.Text(bottom, height=7, wrap="word")
-        self.log.pack(side="right", fill="x", expand=True, padx=(20, 0))
-
-    def write_log(self, text):
-        self.log.insert("end", datetime.now().strftime("[%H:%M:%S] ") + text + "\n")
-        self.log.see("end")
-
-    def refresh(self):
-        for x in self.tree.get_children():
-            self.tree.delete(x)
-
-        total_value = total_cost = 0
-        for s in get_stocks():
-            price = s["last_price"]
-            value = price * s["shares"] if price is not None else None
-            cost = s["avg_cost"] * s["shares"]
-            profit = value - cost if value is not None else None
-            if value is not None:
-                total_value += value
-                total_cost += cost
-
-            signal = "—"
             try:
-                signal = signal_for(s, indicators(s["code"]))["signal"]
+                yf.config.network.retries = 2
             except Exception:
                 pass
 
-            self.tree.insert("", "end", values=(
-                s["code"], s["name"], s["shares"], money(s["avg_cost"]),
-                money(price), money(value), money(profit), signal
-            ))
-
-        p = total_value - total_cost
-        r = p / total_cost * 100 if total_cost else 0
-        self.summary.config(
-            text=f"評価額：{money(total_value)}    投資元本：{money(total_cost)}    "
-                 f"含み損益：{money(p)}（{pct(r)}）"
-        )
-
-    def add_dialog(self):
-        win = tk.Toplevel(self)
-        win.title("保有株を追加")
-        win.resizable(False, False)
-        fields = [
-            ("銘柄コード", "7203"),
-            ("銘柄名", "トヨタ自動車"),
-            ("購入株数", "100"),
-            ("購入価格", "2500"),
-            ("買い目標価格（任意）", ""),
-            ("売り目標価格（任意）", ""),
-        ]
-        entries = {}
-        for i, (label, default) in enumerate(fields):
-            ttk.Label(win, text=label).grid(row=i, column=0, padx=10, pady=6, sticky="w")
-            e = ttk.Entry(win, width=25)
-            e.insert(0, default)
-            e.grid(row=i, column=1, padx=10, pady=6)
-            entries[label] = e
-
-        def save():
             try:
-                code = entries["銘柄コード"].get().strip()
-                name = entries["銘柄名"].get().strip()
-                shares = int(entries["購入株数"].get())
-                price = float(entries["購入価格"].get())
-                bt = entries["買い目標価格（任意）"].get().strip()
-                st = entries["売り目標価格（任意）"].get().strip()
-                buy_target = float(bt) if bt else None
-                sell_target = float(st) if st else None
-                if not code or not name or shares <= 0 or price <= 0:
-                    raise ValueError
-                add_purchase(code, name, shares, price, buy_target, sell_target)
-                win.destroy()
-                self.refresh()
-                self.write_log(f"{name}（{code}）を登録しました。")
+                yf.config.locale.lang = "ja-JP"
+                yf.config.locale.region = "JP"
             except Exception:
-                messagebox.showerror("入力エラー", "入力内容を確認してください。")
+                pass
 
-        ttk.Button(win, text="登録", command=save).grid(
-            row=len(fields), column=0, columnspan=2, pady=12
+    def _from_yfinance(self, ticker):
+
+        if yf is None:
+            return None
+
+        history = yf.Ticker(ticker).history(
+            period="3mo",
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
         )
 
-    def update_prices(self):
-        self.status.config(text="株価更新中…")
-        def work():
-            for s in get_stocks():
+        if history is None or history.empty:
+            return None
+
+        closes = []
+        volumes = []
+
+        for value in history["Close"].tolist():
+
+            if value is not None:
+
                 try:
-                    p = provider.price(s["code"])
-                    save_price(s["code"], p)
-                    self.after(0, lambda s=s, p=p: self.write_log(f"{s['name']} {money(p)}"))
-                except Exception as e:
-                    self.after(0, lambda e=e, s=s: self.write_log(f"{s['name']} 更新失敗: {e}"))
-            self.after(0, self.refresh)
-            self.after(0, lambda: self.status.config(text="更新完了"))
-        threading.Thread(target=work, daemon=True).start()
+                    closes.append(float(value))
+                except (TypeError, ValueError):
+                    pass
 
-    def analyze(self):
-        def work():
-            for s in get_stocks():
-                try:
-                    ind = indicators(s["code"])
-                    sig = signal_for(s, ind)
-                    self.after(0, lambda s=s, sig=sig: self.write_log(
-                        f"{s['name']}：{sig['signal']} / " + "、".join(sig["reasons"][:3])
-                    ))
-                    if sig["signal"] in ("🟢 買い候補", "🔴 売り候補") and should_alert(s, sig["signal"]):
-                        text = (
-                            f"{sig['signal']}\n"
-                            f"{s['name']}（{s['code']}）\n"
-                            f"現在値：{money(ind['price'])}\n"
-                            f"RSI：{ind['rsi']:.1f}\n"
-                            f"前日比：{pct(ind['change'])}\n"
-                            f"理由：{'、'.join(sig['reasons'][:4])}\n\n"
-                            "※投資判断を保証するものではありません。"
-                        )
-                        ok, msg = line_send(text)
-                        mark_alert(s["code"], sig["signal"])
-                        self.after(0, lambda msg=msg: self.write_log(msg))
-                        self.after(0, lambda text=text, sig=sig: desktop_notify(sig["signal"], text))
-                except Exception as e:
-                    self.after(0, lambda e=e: self.write_log(f"分析失敗: {e}"))
-            self.after(0, self.refresh)
-        threading.Thread(target=work, daemon=True).start()
+        if "Volume" in history.columns:
 
-    def show_report(self):
-        report = build_daily_report()
-        win = tk.Toplevel(self)
-        win.title("本日の投資まとめ")
-        win.geometry("750x600")
-        text = tk.Text(win, wrap="word", font=("Yu Gothic UI", 11))
-        text.pack(fill="both", expand=True, padx=10, pady=10)
-        text.insert("1.0", report)
-        text.config(state="disabled")
-        ttk.Button(win, text="LINEへ送信", command=lambda: self.send_report(report)).pack(pady=8)
+            for value in history["Volume"].tolist():
 
-    def send_report(self, report):
-        ok, msg = line_send(report)
-        self.write_log(msg)
-        if ok:
-            messagebox.showinfo("通知", "LINEへ送信しました。")
-        else:
-            messagebox.showwarning("通知", msg)
+                if value is not None:
 
-    def toggle_monitor(self):
-        if self.monitoring:
-            self.monitoring = False
-            self.monitor_btn.config(text="監視開始")
-            self.status.config(text="停止中")
+                    try:
+                        volumes.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+
+        if not closes:
+            return None
+
+        return {
+            "price": closes[-1],
+            "previous_close": (
+                closes[-2]
+                if len(closes) >= 2
+                else closes[-1]
+            ),
+            "closes": closes,
+            "volume": (
+                volumes[-1]
+                if volumes
+                else 0.0
+            ),
+            "source": "yfinance",
+        }
+
+    def _from_yahoo_chart(self, ticker):
+
+        encoded = quote(ticker, safe="")
+
+        urls = [
+
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{encoded}?range=3mo&interval=1d"
+            f"&events=history&includeAdjustedClose=true",
+
+            f"https://query2.finance.yahoo.com/v8/finance/chart/"
+            f"{encoded}?range=3mo&interval=1d"
+            f"&events=history&includeAdjustedClose=true",
+        ]
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/154.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+        }
+
+        errors = []
+
+        for url in urls:
+
+            try:
+
+                request = Request(
+                    url,
+                    headers=headers
+                )
+
+                with urlopen(
+                    request,
+                    timeout=15
+                ) as response:
+
+                    payload = json.loads(
+                        response.read().decode("utf-8")
+                    )
+
+                result = (
+                    payload
+                    .get("chart", {})
+                    .get("result")
+                )
+
+                if not result:
+                    continue
+
+                quote_data = (
+                    result[0]
+                    .get("indicators", {})
+                    .get("quote", [{}])[0]
+                )
+
+                closes = [
+                    float(v)
+                    for v in quote_data.get("close", [])
+                    if v is not None
+                ]
+
+                volumes = [
+                    float(v)
+                    for v in quote_data.get("volume", [])
+                    if v is not None
+                ]
+
+                if not closes:
+                    continue
+
+                return {
+                    "price": closes[-1],
+
+                    "previous_close": (
+                        closes[-2]
+                        if len(closes) >= 2
+                        else closes[-1]
+                    ),
+
+                    "closes": closes,
+
+                    "volume": (
+                        volumes[-1]
+                        if volumes
+                        else 0.0
+                    ),
+
+                    "source": "Yahoo Finance Chart API",
+                }
+
+            except Exception as exc:
+
+                errors.append(str(exc))
+
+        if errors:
+            raise RuntimeError(
+                " / ".join(errors)
+            )
+
+        return None
+
+    def get_price(self, code):
+
+        ticker = normalize_ticker(code)
+
+        errors = []
+
+        # -------------------------
+        # ① yfinance
+        # -------------------------
+
+        try:
+
+            data = self._from_yfinance(ticker)
+
+            if data:
+                return data
+
+        except Exception as exc:
+
+            errors.append(
+                f"yfinance: {exc}"
+            )
+
+        # -------------------------
+        # ② Yahoo Finance API
+        # -------------------------
+
+        try:
+
+            data = self._from_yahoo_chart(ticker)
+
+            if data:
+                return data
+
+        except Exception as exc:
+
+            errors.append(
+                f"Yahoo API: {exc}"
+            )
+
+        detail = (
+            " / ".join(errors)
+            if errors
+            else "価格データが空でした"
+        )
+
+        raise RuntimeError(
+            f"{ticker} の株価を取得できませんでした。"
+            f"{detail}"
+        )
+
+
+class StockDB:
+
+    def __init__(self, path=DB_FILE):
+
+        self.conn = sqlite3.connect(
+            path,
+            check_same_thread=False
+        )
+
+        self.lock = threading.Lock()
+
+        self._create_tables()
+
+    def _create_tables(self):
+
+        with self.lock:
+
+            cur = self.conn.cursor()
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS stocks (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    code TEXT UNIQUE NOT NULL,
+
+                    name TEXT NOT NULL,
+
+                    target_buy REAL DEFAULT 0,
+
+                    target_sell REAL DEFAULT 0,
+
+                    current_price REAL DEFAULT 0,
+
+                    previous_close REAL DEFAULT 0,
+
+                    volume REAL DEFAULT 0,
+
+                    updated_at TEXT
+
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS purchases (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    stock_id INTEGER NOT NULL,
+
+                    shares INTEGER NOT NULL,
+
+                    price REAL NOT NULL,
+
+                    purchased_at TEXT NOT NULL,
+
+                    FOREIGN KEY(stock_id)
+                    REFERENCES stocks(id)
+
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS alerts (
+
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                    code TEXT NOT NULL,
+
+                    alert_type TEXT NOT NULL,
+
+                    alert_key TEXT NOT NULL,
+
+                    created_at TEXT NOT NULL,
+
+                    UNIQUE(
+                        code,
+                        alert_type,
+                        alert_key
+                    )
+
+                )
+            """)
+
+            self.conn.commit()
+
+    def add_stock(self, code, name):
+
+        with self.lock:
+
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO stocks
+                (
+                    code,
+                    name,
+                    updated_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    code,
+                    name,
+                    datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                )
+            )
+
+            self.conn.commit()
+
+    def add_purchase(
+        self,
+        code,
+        shares,
+        price
+    ):
+
+        with self.lock:
+
+            cur = self.conn.cursor()
+
+            cur.execute(
+                "SELECT id FROM stocks WHERE code=?",
+                (code,)
+            )
+
+            row = cur.fetchone()
+
+            if not row:
+
+                raise ValueError(
+                    "先に銘柄を登録してください。"
+                )
+
+            cur.execute(
+                """
+                INSERT INTO purchases
+                (
+                    stock_id,
+                    shares,
+                    price,
+                    purchased_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    row[0],
+                    shares,
+                    price,
+                    datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                )
+            )
+
+            self.conn.commit()
+
+    def update_price(
+        self,
+        code,
+        data
+    ):
+
+        with self.lock:
+
+            self.conn.execute(
+                """
+                UPDATE stocks
+
+                SET
+                    current_price=?,
+                    previous_close=?,
+                    volume=?,
+                    updated_at=?
+
+                WHERE code=?
+                """,
+                (
+                    data["price"],
+                    data["previous_close"],
+                    data["volume"],
+                    datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                    code
+                )
+            )
+
+            self.conn.commit()
+
+    def set_targets(
+        self,
+        code,
+        buy_price,
+        sell_price
+    ):
+
+        with self.lock:
+
+            self.conn.execute(
+                """
+                UPDATE stocks
+
+                SET
+                    target_buy=?,
+                    target_sell=?
+
+                WHERE code=?
+                """,
+                (
+                    buy_price,
+                    sell_price,
+                    code
+                )
+            )
+
+            self.conn.commit()
+
+    def get_stocks(self):
+
+        with self.lock:
+
+            cur = self.conn.cursor()
+
+            cur.execute("""
+                SELECT
+
+                    s.id,
+                    s.code,
+                    s.name,
+                    s.target_buy,
+                    s.target_sell,
+                    s.current_price,
+                    s.previous_close,
+                    s.volume,
+                    s.updated_at,
+
+                    COALESCE(
+                        SUM(p.shares),
+                        0
+                    ),
+
+                    COALESCE(
+                        SUM(
+                            p.shares * p.price
+                        ),
+                        0
+                    )
+
+                FROM stocks s
+
+                LEFT JOIN purchases p
+                ON p.stock_id = s.id
+
+                GROUP BY s.id
+
+                ORDER BY s.code
+            """)
+
+            rows = cur.fetchall()
+
+        result = []
+
+        for row in rows:
+
+            (
+                stock_id,
+                code,
+                name,
+                target_buy,
+                target_sell,
+                current_price,
+                previous_close,
+                volume,
+                updated_at,
+                shares,
+                total_cost
+            ) = row
+
+            average = (
+                total_cost / shares
+                if shares
+                else 0
+            )
+
+            value = (
+                current_price * shares
+                if current_price
+                else 0
+            )
+
+            profit = (
+                value - total_cost
+                if shares
+                else 0
+            )
+
+            rate = (
+                profit / total_cost * 100
+                if total_cost
+                else 0
+            )
+
+            result.append({
+
+                "id": stock_id,
+
+                "code": code,
+
+                "name": name,
+
+                "target_buy": (
+                    target_buy or 0
+                ),
+
+                "target_sell": (
+                    target_sell or 0
+                ),
+
+                "current_price": (
+                    current_price or 0
+                ),
+
+                "previous_close": (
+                    previous_close or 0
+                ),
+
+                "volume": (
+                    volume or 0
+                ),
+
+                "updated_at": (
+                    updated_at or ""
+                ),
+
+                "shares": shares,
+
+                "total_cost": total_cost,
+
+                "average": average,
+
+                "value": value,
+
+                "profit": profit,
+
+                "rate": rate,
+            })
+
+        return result
+
+    def has_alert(
+        self,
+        code,
+        alert_type,
+        alert_key
+    ):
+
+        with self.lock:
+
+            row = self.conn.execute(
+                """
+                SELECT 1
+
+                FROM alerts
+
+                WHERE
+                    code=?
+                    AND alert_type=?
+                    AND alert_key=?
+                """,
+                (
+                    code,
+                    alert_type,
+                    alert_key
+                )
+            ).fetchone()
+
+            return row is not None
+
+    def add_alert(
+        self,
+        code,
+        alert_type,
+        alert_key
+    ):
+
+        with self.lock:
+
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO alerts
+                (
+                    code,
+                    alert_type,
+                    alert_key,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    code,
+                    alert_type,
+                    alert_key,
+                    datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                )
+            )
+
+            self.conn.commit()
+
+
+class StockWatcherApp:
+
+    def __init__(self, root):
+
+        self.root = root
+
+        self.root.title(
+            "Stock Watcher"
+        )
+
+        self.root.geometry(
+            "1180x700"
+        )
+
+        self.root.minsize(
+            1000,
+            600
+        )
+
+        self.db = StockDB()
+
+        self.provider = PriceProvider()
+
+        self.monitoring = False
+
+        self.monitor_thread = None
+
+        self.line_token = os.getenv(
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            ""
+        ).strip()
+
+        self.line_user_id = os.getenv(
+            "LINE_USER_ID",
+            ""
+        ).strip()
+
+        self._build_ui()
+
+        self.refresh_table()
+
+    def _build_ui(self):
+
+        top = ttk.Frame(
+            self.root,
+            padding=10
+        )
+
+        top.pack(fill="x")
+
+        ttk.Label(
+            top,
+            text="銘柄コード"
+        ).grid(
+            row=0,
+            column=0,
+            padx=5,
+            pady=5
+        )
+
+        self.code_var = tk.StringVar()
+
+        ttk.Entry(
+            top,
+            textvariable=self.code_var,
+            width=12
+        ).grid(
+            row=0,
+            column=1,
+            padx=5
+        )
+
+        ttk.Label(
+            top,
+            text="銘柄名"
+        ).grid(
+            row=0,
+            column=2,
+            padx=5
+        )
+
+        self.name_var = tk.StringVar()
+
+        ttk.Entry(
+            top,
+            textvariable=self.name_var,
+            width=18
+        ).grid(
+            row=0,
+            column=3,
+            padx=5
+        )
+
+        ttk.Button(
+            top,
+            text="銘柄登録",
+            command=self.register_stock
+        ).grid(
+            row=0,
+            column=4,
+            padx=8
+        )
+
+        ttk.Button(
+            top,
+            text="株価更新",
+            command=self.update_prices_async
+        ).grid(
+            row=0,
+            column=5,
+            padx=8
+        )
+
+        ttk.Button(
+            top,
+            text="目標価格設定",
+            command=self.set_target
+        ).grid(
+            row=0,
+            column=6,
+            padx=8
+        )
+
+        ttk.Button(
+            top,
+            text="日次レポート",
+            command=self.show_daily_report
+        ).grid(
+            row=0,
+            column=7,
+            padx=8
+        )
+
+        purchase = ttk.LabelFrame(
+            self.root,
+            text="買付登録",
+            padding=10
+        )
+
+        purchase.pack(
+            fill="x",
+            padx=10,
+            pady=(0, 10)
+        )
+
+        ttk.Label(
+            purchase,
+            text="銘柄コード"
+        ).grid(
+            row=0,
+            column=0,
+            padx=5
+        )
+
+        self.purchase_code_var = tk.StringVar()
+
+        ttk.Entry(
+            purchase,
+            textvariable=self.purchase_code_var,
+            width=12
+        ).grid(
+            row=0,
+            column=1,
+            padx=5
+        )
+
+        ttk.Label(
+            purchase,
+            text="株数"
+        ).grid(
+            row=0,
+            column=2,
+            padx=5
+        )
+
+        self.shares_var = tk.StringVar()
+
+        ttk.Entry(
+            purchase,
+            textvariable=self.shares_var,
+            width=10
+        ).grid(
+            row=0,
+            column=3,
+            padx=5
+        )
+
+        ttk.Label(
+            purchase,
+            text="購入価格"
+        ).grid(
+            row=0,
+            column=4,
+            padx=5
+        )
+
+        self.purchase_price_var = tk.StringVar()
+
+        ttk.Entry(
+            purchase,
+            textvariable=self.purchase_price_var,
+            width=12
+        ).grid(
+            row=0,
+            column=5,
+            padx=5
+        )
+
+        ttk.Button(
+            purchase,
+            text="買付登録",
+            command=self.register_purchase
+        ).grid(
+            row=0,
+            column=6,
+            padx=8
+        )
+
+        controls = ttk.Frame(
+            self.root,
+            padding=(10, 0, 10, 10)
+        )
+
+        controls.pack(
+            fill="x"
+        )
+
+        self.monitor_var = tk.StringVar(
+            value="自動監視：停止中"
+        )
+
+        ttk.Label(
+            controls,
+            textvariable=self.monitor_var
+        ).pack(
+            side="left"
+        )
+
+        ttk.Button(
+            controls,
+            text="自動監視開始/停止",
+            command=self.toggle_monitoring
+        ).pack(
+            side="left",
+            padx=15
+        )
+
+        ttk.Button(
+            controls,
+            text="LINEテスト",
+            command=self.test_line
+        ).pack(
+            side="left"
+        )
+
+        self.status_var = tk.StringVar(
+            value="準備完了"
+        )
+
+        ttk.Label(
+            controls,
+            textvariable=self.status_var
+        ).pack(
+            side="right"
+        )
+
+        columns = (
+            "code",
+            "name",
+            "shares",
+            "average",
+            "current",
+            "value",
+            "profit",
+            "rate",
+            "updated"
+        )
+
+        frame = ttk.Frame(
+            self.root,
+            padding=10
+        )
+
+        frame.pack(
+            fill="both",
+            expand=True
+        )
+
+        self.tree = ttk.Treeview(
+            frame,
+            columns=columns,
+            show="headings"
+        )
+
+        headings = {
+
+            "code": "コード",
+
+            "name": "銘柄名",
+
+            "shares": "保有株数",
+
+            "average": "平均取得価格",
+
+            "current": "現在価格",
+
+            "value": "評価額",
+
+            "profit": "損益",
+
+            "rate": "損益率",
+
+            "updated": "更新時刻",
+        }
+
+        widths = {
+
+            "code": 90,
+
+            "name": 150,
+
+            "shares": 90,
+
+            "average": 110,
+
+            "current": 110,
+
+            "value": 120,
+
+            "profit": 110,
+
+            "rate": 90,
+
+            "updated": 160,
+        }
+
+        for col in columns:
+
+            self.tree.heading(
+                col,
+                text=headings[col]
+            )
+
+            self.tree.column(
+                col,
+                width=widths[col],
+                anchor="center"
+            )
+
+        scrollbar = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=self.tree.yview
+        )
+
+        self.tree.configure(
+            yscrollcommand=scrollbar.set
+        )
+
+        self.tree.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        scrollbar.pack(
+            side="right",
+            fill="y"
+        )
+
+    def register_stock(self):
+
+        code = self.code_var.get().strip()
+
+        name = self.name_var.get().strip()
+
+        if not code or not name:
+
+            messagebox.showwarning(
+                "入力不足",
+                "銘柄コードと銘柄名を入力してください。"
+            )
+
             return
+
+        code = normalize_ticker(code)
+
+        self.db.add_stock(
+            code,
+            name
+        )
+
+        self.status_var.set(
+            f"{code} を登録しました"
+        )
+
+        self.refresh_table()
+
+    def register_purchase(self):
+
+        code = normalize_ticker(
+            self.purchase_code_var.get().strip()
+        )
+
+        try:
+
+            shares = int(
+                self.shares_var.get()
+            )
+
+            price = float(
+                self.purchase_price_var.get()
+            )
+
+            if shares <= 0 or price <= 0:
+                raise ValueError
+
+        except ValueError:
+
+            messagebox.showwarning(
+                "入力エラー",
+                "株数と購入価格を正しく入力してください。"
+            )
+
+            return
+
+        try:
+
+            self.db.add_purchase(
+                code,
+                shares,
+                price
+            )
+
+        except Exception as exc:
+
+            messagebox.showerror(
+                "登録エラー",
+                str(exc)
+            )
+
+            return
+
+        self.status_var.set(
+            f"{code} の買付を登録しました"
+        )
+
+        self.refresh_table()
+
+    def set_target(self):
+
+        selected = self.tree.selection()
+
+        if not selected:
+
+            messagebox.showwarning(
+                "未選択",
+                "目標価格を設定する銘柄を選択してください。"
+            )
+
+            return
+
+        code = self.tree.item(
+            selected[0]
+        )["values"][0]
+
+        buy = simpledialog.askfloat(
+            "買い目標価格",
+            f"{code} の買い目標価格を入力してください。\n不要なら0",
+            minvalue=0
+        )
+
+        if buy is None:
+            return
+
+        sell = simpledialog.askfloat(
+            "売り目標価格",
+            f"{code} の売り目標価格を入力してください。\n不要なら0",
+            minvalue=0
+        )
+
+        if sell is None:
+            return
+
+        self.db.set_targets(
+            code,
+            buy,
+            sell
+        )
+
+        self.status_var.set(
+            f"{code} の目標価格を更新しました"
+        )
+
+    def update_prices_async(self):
+
+        threading.Thread(
+            target=self._update_prices_worker,
+            daemon=True
+        ).start()
+
+    def _update_prices_worker(self):
+
+        self.root.after(
+            0,
+            lambda: self.status_var.set(
+                "株価を取得中..."
+            )
+        )
+
+        stocks = self.db.get_stocks()
+
+        if not stocks:
+
+            self.root.after(
+                0,
+                lambda: messagebox.showinfo(
+                    "株価更新",
+                    "登録されている銘柄がありません。"
+                )
+            )
+
+            return
+
+        success = 0
+
+        errors = []
+
+        for stock in stocks:
+
+            try:
+
+                data = self.provider.get_price(
+                    stock["code"]
+                )
+
+                self.db.update_price(
+                    stock["code"],
+                    data
+                )
+
+                success += 1
+
+                signal = self.calculate_signal(
+                    stock,
+                    data
+                )
+
+                self.send_signal_if_needed(
+                    stock,
+                    data,
+                    signal
+                )
+
+            except Exception as exc:
+
+                errors.append(
+                    f'{stock["code"]}: {exc}'
+                )
+
+        self.root.after(
+            0,
+            self.refresh_table
+        )
+
+        if errors:
+
+            message = (
+                f"{success}銘柄更新しました。\n\n"
+                + "\n".join(
+                    errors[:5]
+                )
+            )
+
+            if len(errors) > 5:
+
+                message += (
+                    f"\n...ほか "
+                    f"{len(errors) - 5}件"
+                )
+
+            self.root.after(
+                0,
+                lambda m=message:
+                messagebox.showwarning(
+                    "株価更新結果",
+                    m
+                )
+            )
+
+            self.root.after(
+                0,
+                lambda:
+                self.status_var.set(
+                    "一部更新失敗"
+                )
+            )
+
+        else:
+
+            self.root.after(
+                0,
+                lambda:
+                self.status_var.set(
+                    f"{success}銘柄の株価を更新しました"
+                )
+            )
+
+    def calculate_signal(
+        self,
+        stock,
+        data
+    ):
+
+        price = data["price"]
+
+        closes = data.get(
+            "closes",
+            []
+        )
+
+        score = 0
+
+        reasons = []
+
+        if (
+            stock["target_buy"] > 0
+            and price <= stock["target_buy"]
+        ):
+
+            score += 2
+
+            reasons.append(
+                "買い目標価格以下"
+            )
+
+        if (
+            stock["target_sell"] > 0
+            and price >= stock["target_sell"]
+        ):
+
+            score -= 2
+
+            reasons.append(
+                "売り目標価格以上"
+            )
+
+        if len(closes) >= 25:
+
+            sma5 = (
+                sum(closes[-5:]) / 5
+            )
+
+            sma25 = (
+                sum(closes[-25:]) / 25
+            )
+
+            if sma5 > sma25:
+
+                score += 1
+
+                reasons.append(
+                    "短期移動平均が中期移動平均を上回る"
+                )
+
+            elif sma5 < sma25:
+
+                score -= 1
+
+                reasons.append(
+                    "短期移動平均が中期移動平均を下回る"
+                )
+
+        if price > data["previous_close"]:
+
+            reasons.append(
+                "前日終値より上昇"
+            )
+
+        elif price < data["previous_close"]:
+
+            reasons.append(
+                "前日終値より下落"
+            )
+
+        if score >= 2:
+
+            label = "買い候補"
+
+        elif score <= -2:
+
+            label = "売り候補"
+
+        else:
+
+            label = "様子見"
+
+        return {
+
+            "label": label,
+
+            "score": score,
+
+            "reasons": reasons,
+        }
+
+    def send_signal_if_needed(
+        self,
+        stock,
+        data,
+        signal
+    ):
+
+        if signal["label"] == "様子見":
+            return
+
+        today = date.today().isoformat()
+
+        if self.db.has_alert(
+            stock["code"],
+            signal["label"],
+            today
+        ):
+
+            return
+
+        message = (
+
+            "【株価シグナル】\n"
+
+            f"{stock['name']} "
+            f"({stock['code']})\n"
+
+            f"現在価格："
+            f"{data['price']:,.0f}円\n"
+
+            f"判定："
+            f"{signal['label']}\n"
+
+            f"理由："
+            f"{'、'.join(signal['reasons'])}"
+        )
+
+        self.send_line(
+            message
+        )
+
+        self.db.add_alert(
+            stock["code"],
+            signal["label"],
+            today
+        )
+
+        self.root.after(
+            0,
+            lambda m=message:
+            messagebox.showinfo(
+                "株価シグナル",
+                m
+            )
+        )
+
+    def send_line(self, message):
+
+        if (
+            not self.line_token
+            or not self.line_user_id
+            or requests is None
+        ):
+
+            return False
+
+        try:
+
+            response = requests.post(
+
+                "https://api.line.me/v2/bot/message/push",
+
+                headers={
+
+                    "Content-Type":
+                    "application/json",
+
+                    "Authorization":
+                    f"Bearer {self.line_token}",
+                },
+
+                json={
+
+                    "to":
+                    self.line_user_id,
+
+                    "messages": [
+
+                        {
+                            "type": "text",
+
+                            "text":
+                            message[:5000]
+                        }
+
+                    ],
+                },
+
+                timeout=15,
+            )
+
+            return response.ok
+
+        except Exception:
+
+            return False
+
+    def test_line(self):
+
+        if (
+            not self.line_token
+            or not self.line_user_id
+        ):
+
+            messagebox.showwarning(
+                "LINE設定",
+                "LINE_CHANNEL_ACCESS_TOKEN と LINE_USER_ID を設定してください。"
+            )
+
+            return
+
+        if self.send_line(
+            "Stock Watcher のLINE通知テストです。"
+        ):
+
+            messagebox.showinfo(
+                "LINE",
+                "LINE通知を送信しました。"
+            )
+
+        else:
+
+            messagebox.showerror(
+                "LINE",
+                "LINE通知の送信に失敗しました。"
+            )
+
+    def toggle_monitoring(self):
+
+        if self.monitoring:
+
+            self.monitoring = False
+
+            self.monitor_var.set(
+                "自動監視：停止中"
+            )
+
+            self.status_var.set(
+                "自動監視を停止しました"
+            )
+
+            return
+
         self.monitoring = True
-        self.monitor_btn.config(text="監視停止")
-        self.status.config(text="監視中")
-        threading.Thread(target=self.monitor_loop, daemon=True).start()
+
+        self.monitor_var.set(
+            "自動監視：稼働中"
+        )
+
+        self.status_var.set(
+            "自動監視を開始しました"
+        )
+
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_loop,
+            daemon=True
+        )
+
+        self.monitor_thread.start()
 
     def monitor_loop(self):
-        while self.monitoring:
-            self.update_prices()
-            time.sleep(CHECK_INTERVAL)
-            if not self.monitoring:
-                break
-            self.analyze()
-            now = datetime.now()
-            report_h, report_m = map(int, DAILY_REPORT_TIME.split(":"))
-            if now.hour == report_h and now.minute == report_m and self.last_report_date != now.date():
-                self.last_report_date = now.date()
-                report = build_daily_report()
-                ok, msg = line_send(report)
-                self.after(0, lambda msg=msg: self.write_log(msg))
-                self.after(0, lambda: desktop_notify("本日の投資まとめ", report[:1500]))
 
-    def on_close(self):
-        self.monitoring = False
-        self.destroy()
+        while self.monitoring:
+
+            self._update_prices_worker()
+
+            for _ in range(300):
+
+                if not self.monitoring:
+                    break
+
+                time.sleep(1)
+
+    def show_daily_report(self):
+
+        stocks = self.db.get_stocks()
+
+        if not stocks:
+
+            messagebox.showinfo(
+                "日次レポート",
+                "登録銘柄がありません。"
+            )
+
+            return
+
+        total_cost = sum(
+            s["total_cost"]
+            for s in stocks
+        )
+
+        total_value = sum(
+            s["value"]
+            for s in stocks
+        )
+
+        total_profit = (
+            total_value - total_cost
+        )
+
+        lines = [
+
+            f"日次レポート"
+            f"（{date.today().isoformat()}）",
+
+            "",
+
+            f"取得総額："
+            f"{total_cost:,.0f}円",
+
+            f"評価総額："
+            f"{total_value:,.0f}円",
+
+            f"含み損益："
+            f"{total_profit:+,.0f}円",
+
+            "",
+        ]
+
+        for stock in stocks:
+
+            if stock["shares"] <= 0:
+                continue
+
+            change = (
+                stock["current_price"]
+                - stock["previous_close"]
+            )
+
+            change_rate = (
+
+                change
+                / stock["previous_close"]
+                * 100
+
+                if stock["previous_close"]
+                else 0
+            )
+
+            if change > 0:
+                direction = "上昇"
+
+            elif change < 0:
+                direction = "下落"
+
+            else:
+                direction = "変化なし"
+
+            lines.append(
+
+                f"{stock['name']} "
+                f"({stock['code']})："
+
+                f"{stock['current_price']:,.0f}円 / "
+
+                f"損益 "
+                f"{stock['profit']:+,.0f}円 / "
+
+                f"前日比 "
+                f"{change:+,.0f}円 "
+
+                f"({change_rate:+.2f}%) / "
+
+                f"{direction}"
+            )
+
+        report = "\n".join(
+            lines
+        )
+
+        window = tk.Toplevel(
+            self.root
+        )
+
+        window.title(
+            "日次レポート"
+        )
+
+        window.geometry(
+            "800x500"
+        )
+
+        text = tk.Text(
+            window,
+            wrap="word"
+        )
+
+        text.pack(
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=10
+        )
+
+        text.insert(
+            "1.0",
+            report
+        )
+
+        text.configure(
+            state="disabled"
+        )
+
+        ttk.Button(
+            window,
+            text="LINEへ送信",
+            command=lambda:
+            self.send_daily_report_to_line(
+                report
+            )
+        ).pack(
+            pady=(0, 10)
+        )
+
+    def send_daily_report_to_line(
+        self,
+        report
+    ):
+
+        if self.send_line(
+            report
+        ):
+
+            messagebox.showinfo(
+                "LINE",
+                "日次レポートをLINEへ送信しました。"
+            )
+
+        else:
+
+            messagebox.showerror(
+                "LINE",
+                "LINEへの送信に失敗しました。"
+            )
+
+    def refresh_table(self):
+
+        for item in self.tree.get_children():
+
+            self.tree.delete(
+                item
+            )
+
+        for stock in self.db.get_stocks():
+
+            self.tree.insert(
+
+                "",
+
+                "end",
+
+                values=(
+
+                    stock["code"],
+
+                    stock["name"],
+
+                    f"{stock['shares']:,}",
+
+                    f"{stock['average']:,.2f}",
+
+                    f"{stock['current_price']:,.2f}",
+
+                    f"{stock['value']:,.0f}",
+
+                    f"{stock['profit']:+,.0f}",
+
+                    f"{stock['rate']:+.2f}%",
+
+                    stock["updated_at"].replace(
+                        "T",
+                        " "
+                    ),
+                )
+            )
+
+
+def main():
+
+    root = tk.Tk()
+
+    StockWatcherApp(
+        root
+    )
+
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    app = App()
-    app.protocol("WM_DELETE_WINDOW", app.on_close)
-    app.mainloop()
+
+    main()
