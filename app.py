@@ -239,10 +239,6 @@ class PriceProvider:
 
         errors = []
 
-        # -------------------------
-        # ① yfinance
-        # -------------------------
-
         try:
 
             data = self._from_yfinance(ticker)
@@ -255,10 +251,6 @@ class PriceProvider:
             errors.append(
                 f"yfinance: {exc}"
             )
-
-        # -------------------------
-        # ② Yahoo Finance API
-        # -------------------------
 
         try:
 
@@ -306,66 +298,42 @@ class StockDB:
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS stocks (
-
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                     code TEXT UNIQUE NOT NULL,
-
                     name TEXT NOT NULL,
-
                     target_buy REAL DEFAULT 0,
-
                     target_sell REAL DEFAULT 0,
-
                     current_price REAL DEFAULT 0,
-
                     previous_close REAL DEFAULT 0,
-
                     volume REAL DEFAULT 0,
-
                     updated_at TEXT
-
                 )
             """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS purchases (
-
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                     stock_id INTEGER NOT NULL,
-
                     shares INTEGER NOT NULL,
-
                     price REAL NOT NULL,
-
                     purchased_at TEXT NOT NULL,
-
                     FOREIGN KEY(stock_id)
                     REFERENCES stocks(id)
-
                 )
             """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS alerts (
-
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                     code TEXT NOT NULL,
-
                     alert_type TEXT NOT NULL,
-
                     alert_key TEXT NOT NULL,
-
                     created_at TEXT NOT NULL,
-
                     UNIQUE(
                         code,
                         alert_type,
                         alert_key
                     )
-
                 )
             """)
 
@@ -454,13 +422,11 @@ class StockDB:
             self.conn.execute(
                 """
                 UPDATE stocks
-
                 SET
                     current_price=?,
                     previous_close=?,
                     volume=?,
                     updated_at=?
-
                 WHERE code=?
                 """,
                 (
@@ -488,11 +454,9 @@ class StockDB:
             self.conn.execute(
                 """
                 UPDATE stocks
-
                 SET
                     target_buy=?,
                     target_sell=?
-
                 WHERE code=?
                 """,
                 (
@@ -512,7 +476,6 @@ class StockDB:
 
             cur.execute("""
                 SELECT
-
                     s.id,
                     s.code,
                     s.name,
@@ -592,9 +555,7 @@ class StockDB:
             result.append({
 
                 "id": stock_id,
-
                 "code": code,
-
                 "name": name,
 
                 "target_buy": (
@@ -648,9 +609,7 @@ class StockDB:
             row = self.conn.execute(
                 """
                 SELECT 1
-
                 FROM alerts
-
                 WHERE
                     code=?
                     AND alert_type=?
@@ -709,12 +668,12 @@ class StockWatcherApp:
         )
 
         self.root.geometry(
-            "1180x700"
+            "1250x760"
         )
 
         self.root.minsize(
-            1000,
-            600
+            1050,
+            650
         )
 
         self.db = StockDB()
@@ -735,112 +694,259 @@ class StockWatcherApp:
             ""
         ).strip()
 
+        self._setup_style()
+
         self._build_ui()
 
         self.refresh_table()
 
-    def _build_ui(self):
+    def _setup_style(self):
 
-        top = ttk.Frame(
-            self.root,
+        style = ttk.Style()
+
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(
+            ".",
+            font=(
+                "Yu Gothic UI",
+                10
+            )
+        )
+
+        style.configure(
+            "Title.TLabel",
+            font=(
+                "Yu Gothic UI",
+                22,
+                "bold"
+            )
+        )
+
+        style.configure(
+            "Subtitle.TLabel",
+            font=(
+                "Yu Gothic UI",
+                10
+            )
+        )
+
+        style.configure(
+            "Section.TLabelframe",
             padding=10
         )
 
-        top.pack(fill="x")
+        style.configure(
+            "Section.TLabelframe.Label",
+            font=(
+                "Yu Gothic UI",
+                11,
+                "bold"
+            )
+        )
+
+        style.configure(
+            "Action.TButton",
+            padding=(
+                12,
+                7
+            ),
+            font=(
+                "Yu Gothic UI",
+                10,
+                "bold"
+            )
+        )
+
+        style.configure(
+            "Treeview",
+            rowheight=32,
+            font=(
+                "Yu Gothic UI",
+                10
+            )
+        )
+
+        style.configure(
+            "Treeview.Heading",
+            font=(
+                "Yu Gothic UI",
+                10,
+                "bold"
+            ),
+            padding=7
+        )
+
+        style.configure(
+            "Status.TLabel",
+            font=(
+                "Yu Gothic UI",
+                9
+            )
+        )
+
+    def _build_ui(self):
+
+        # ==========================================
+        # ヘッダー
+        # ==========================================
+
+        header = ttk.Frame(
+            self.root,
+            padding=(
+                20,
+                18,
+                20,
+                10
+            )
+        )
+
+        header.pack(
+            fill="x"
+        )
+
+        title_area = ttk.Frame(
+            header
+        )
+
+        title_area.pack(
+            side="left"
+        )
 
         ttk.Label(
-            top,
+            title_area,
+            text="Stock Watcher",
+            style="Title.TLabel"
+        ).pack(
+            anchor="w"
+        )
+
+        ttk.Label(
+            title_area,
+            text="保有株式をかんたんに管理・監視",
+            style="Subtitle.TLabel"
+        ).pack(
+            anchor="w",
+            pady=(2, 0)
+        )
+
+        self.monitor_var = tk.StringVar(
+            value="● 自動監視：停止中"
+        )
+
+        self.monitor_label = ttk.Label(
+            header,
+            textvariable=self.monitor_var,
+            font=(
+                "Yu Gothic UI",
+                10,
+                "bold"
+            )
+        )
+
+        self.monitor_label.pack(
+            side="right",
+            pady=8
+        )
+
+        # ==========================================
+        # 銘柄登録
+        # ==========================================
+
+        stock_frame = ttk.LabelFrame(
+            self.root,
+            text="銘柄登録",
+            style="Section.TLabelframe"
+        )
+
+        stock_frame.pack(
+            fill="x",
+            padx=20,
+            pady=(5, 8)
+        )
+
+        ttk.Label(
+            stock_frame,
             text="銘柄コード"
         ).grid(
             row=0,
             column=0,
-            padx=5,
+            padx=(5, 8),
             pady=5
         )
 
         self.code_var = tk.StringVar()
 
-        ttk.Entry(
-            top,
+        code_entry = ttk.Entry(
+            stock_frame,
             textvariable=self.code_var,
-            width=12
-        ).grid(
+            width=14
+        )
+
+        code_entry.grid(
             row=0,
             column=1,
-            padx=5
+            padx=5,
+            pady=5
         )
 
         ttk.Label(
-            top,
+            stock_frame,
             text="銘柄名"
         ).grid(
             row=0,
             column=2,
-            padx=5
+            padx=(18, 8),
+            pady=5
         )
 
         self.name_var = tk.StringVar()
 
-        ttk.Entry(
-            top,
+        name_entry = ttk.Entry(
+            stock_frame,
             textvariable=self.name_var,
-            width=18
-        ).grid(
+            width=22
+        )
+
+        name_entry.grid(
             row=0,
             column=3,
-            padx=5
+            padx=5,
+            pady=5
         )
 
         ttk.Button(
-            top,
+            stock_frame,
             text="銘柄登録",
+            style="Action.TButton",
             command=self.register_stock
         ).grid(
             row=0,
             column=4,
-            padx=8
+            padx=(18, 5),
+            pady=5
         )
 
-        ttk.Button(
-            top,
-            text="株価更新",
-            command=self.update_prices_async
-        ).grid(
-            row=0,
-            column=5,
-            padx=8
-        )
-
-        ttk.Button(
-            top,
-            text="目標価格設定",
-            command=self.set_target
-        ).grid(
-            row=0,
-            column=6,
-            padx=8
-        )
-
-        ttk.Button(
-            top,
-            text="日次レポート",
-            command=self.show_daily_report
-        ).grid(
-            row=0,
-            column=7,
-            padx=8
-        )
+        # ==========================================
+        # 買付登録
+        # ==========================================
 
         purchase = ttk.LabelFrame(
             self.root,
             text="買付登録",
-            padding=10
+            style="Section.TLabelframe"
         )
 
         purchase.pack(
             fill="x",
-            padx=10,
-            pady=(0, 10)
+            padx=20,
+            pady=(
+                0,
+                8
+            )
         )
 
         ttk.Label(
@@ -849,7 +955,8 @@ class StockWatcherApp:
         ).grid(
             row=0,
             column=0,
-            padx=5
+            padx=(5, 8),
+            pady=5
         )
 
         self.purchase_code_var = tk.StringVar()
@@ -857,11 +964,12 @@ class StockWatcherApp:
         ttk.Entry(
             purchase,
             textvariable=self.purchase_code_var,
-            width=12
+            width=14
         ).grid(
             row=0,
             column=1,
-            padx=5
+            padx=5,
+            pady=5
         )
 
         ttk.Label(
@@ -870,7 +978,8 @@ class StockWatcherApp:
         ).grid(
             row=0,
             column=2,
-            padx=5
+            padx=(18, 8),
+            pady=5
         )
 
         self.shares_var = tk.StringVar()
@@ -878,11 +987,12 @@ class StockWatcherApp:
         ttk.Entry(
             purchase,
             textvariable=self.shares_var,
-            width=10
+            width=12
         ).grid(
             row=0,
             column=3,
-            padx=5
+            padx=5,
+            pady=5
         )
 
         ttk.Label(
@@ -891,7 +1001,8 @@ class StockWatcherApp:
         ).grid(
             row=0,
             column=4,
-            padx=5
+            padx=(18, 8),
+            pady=5
         )
 
         self.purchase_price_var = tk.StringVar()
@@ -899,50 +1010,87 @@ class StockWatcherApp:
         ttk.Entry(
             purchase,
             textvariable=self.purchase_price_var,
-            width=12
+            width=14
         ).grid(
             row=0,
             column=5,
-            padx=5
+            padx=5,
+            pady=5
         )
 
         ttk.Button(
             purchase,
             text="買付登録",
+            style="Action.TButton",
             command=self.register_purchase
         ).grid(
             row=0,
             column=6,
-            padx=8
+            padx=(18, 5),
+            pady=5
         )
 
-        controls = ttk.Frame(
+        # ==========================================
+        # 操作ボタン
+        # ==========================================
+
+        controls = ttk.LabelFrame(
             self.root,
-            padding=(10, 0, 10, 10)
+            text="操作",
+            style="Section.TLabelframe"
         )
 
         controls.pack(
-            fill="x"
-        )
-
-        self.monitor_var = tk.StringVar(
-            value="自動監視：停止中"
-        )
-
-        ttk.Label(
-            controls,
-            textvariable=self.monitor_var
-        ).pack(
-            side="left"
+            fill="x",
+            padx=20,
+            pady=(
+                0,
+                10
+            )
         )
 
         ttk.Button(
             controls,
-            text="自動監視開始/停止",
+            text="株価を更新",
+            style="Action.TButton",
+            command=self.update_prices_async
+        ).pack(
+            side="left",
+            padx=5,
+            pady=5
+        )
+
+        ttk.Button(
+            controls,
+            text="目標価格設定",
+            style="Action.TButton",
+            command=self.set_target
+        ).pack(
+            side="left",
+            padx=5,
+            pady=5
+        )
+
+        ttk.Button(
+            controls,
+            text="日次レポート",
+            style="Action.TButton",
+            command=self.show_daily_report
+        ).pack(
+            side="left",
+            padx=5,
+            pady=5
+        )
+
+        ttk.Button(
+            controls,
+            text="自動監視 開始 / 停止",
+            style="Action.TButton",
             command=self.toggle_monitoring
         ).pack(
             side="left",
-            padx=15
+            padx=5,
+            pady=5
         )
 
         ttk.Button(
@@ -950,7 +1098,9 @@ class StockWatcherApp:
             text="LINEテスト",
             command=self.test_line
         ).pack(
-            side="left"
+            side="left",
+            padx=5,
+            pady=5
         )
 
         self.status_var = tk.StringVar(
@@ -959,9 +1109,32 @@ class StockWatcherApp:
 
         ttk.Label(
             controls,
-            textvariable=self.status_var
+            textvariable=self.status_var,
+            style="Status.TLabel"
         ).pack(
-            side="right"
+            side="right",
+            padx=8
+        )
+
+        # ==========================================
+        # 保有銘柄
+        # ==========================================
+
+        table_frame = ttk.LabelFrame(
+            self.root,
+            text="保有銘柄",
+            style="Section.TLabelframe",
+            padding=8
+        )
+
+        table_frame.pack(
+            fill="both",
+            expand=True,
+            padx=20,
+            pady=(
+                0,
+                15
+            )
         )
 
         columns = (
@@ -976,61 +1149,36 @@ class StockWatcherApp:
             "updated"
         )
 
-        frame = ttk.Frame(
-            self.root,
-            padding=10
-        )
-
-        frame.pack(
-            fill="both",
-            expand=True
-        )
-
         self.tree = ttk.Treeview(
-            frame,
+            table_frame,
             columns=columns,
-            show="headings"
+            show="headings",
+            selectmode="browse"
         )
 
         headings = {
 
             "code": "コード",
-
             "name": "銘柄名",
-
             "shares": "保有株数",
-
             "average": "平均取得価格",
-
             "current": "現在価格",
-
             "value": "評価額",
-
             "profit": "損益",
-
             "rate": "損益率",
-
             "updated": "更新時刻",
         }
 
         widths = {
 
             "code": 90,
-
             "name": 150,
-
-            "shares": 90,
-
-            "average": 110,
-
-            "current": 110,
-
-            "value": 120,
-
-            "profit": 110,
-
+            "shares": 95,
+            "average": 125,
+            "current": 115,
+            "value": 125,
+            "profit": 115,
             "rate": 90,
-
             "updated": 160,
         }
 
@@ -1044,28 +1192,105 @@ class StockWatcherApp:
             self.tree.column(
                 col,
                 width=widths[col],
-                anchor="center"
+                anchor="center",
+                stretch=False
             )
 
-        scrollbar = ttk.Scrollbar(
-            frame,
+        # 損益に応じた行表示
+        self.tree.tag_configure(
+            "profit",
+            foreground="#16803c"
+        )
+
+        self.tree.tag_configure(
+            "loss",
+            foreground="#c62828"
+        )
+
+        self.tree.tag_configure(
+            "normal",
+            foreground="#333333"
+        )
+
+        self.tree.tag_configure(
+            "even",
+            background="#f8fafc"
+        )
+
+        self.tree.tag_configure(
+            "odd",
+            background="#ffffff"
+        )
+
+        y_scroll = ttk.Scrollbar(
+            table_frame,
             orient="vertical",
             command=self.tree.yview
         )
 
+        x_scroll = ttk.Scrollbar(
+            table_frame,
+            orient="horizontal",
+            command=self.tree.xview
+        )
+
         self.tree.configure(
-            yscrollcommand=scrollbar.set
+            yscrollcommand=y_scroll.set,
+            xscrollcommand=x_scroll.set
         )
 
-        self.tree.pack(
-            side="left",
-            fill="both",
-            expand=True
+        self.tree.grid(
+            row=0,
+            column=0,
+            sticky="nsew"
         )
 
-        scrollbar.pack(
-            side="right",
-            fill="y"
+        y_scroll.grid(
+            row=0,
+            column=1,
+            sticky="ns"
+        )
+
+        x_scroll.grid(
+            row=1,
+            column=0,
+            sticky="ew"
+        )
+
+        table_frame.rowconfigure(
+            0,
+            weight=1
+        )
+
+        table_frame.columnconfigure(
+            0,
+            weight=1
+        )
+
+        # ==========================================
+        # フッター
+        # ==========================================
+
+        footer = ttk.Frame(
+            self.root,
+            padding=(
+                20,
+                0,
+                20,
+                10
+            )
+        )
+
+        footer.pack(
+            fill="x"
+        )
+
+        ttk.Label(
+            footer,
+            text="※ 株価情報はYahoo Financeから取得します。",
+            style="Status.TLabel"
+        ).pack(
+            side="left"
         )
 
     def register_stock(self):
@@ -1548,7 +1773,7 @@ class StockWatcherApp:
             self.monitoring = False
 
             self.monitor_var.set(
-                "自動監視：停止中"
+                "● 自動監視：停止中"
             )
 
             self.status_var.set(
@@ -1560,7 +1785,7 @@ class StockWatcherApp:
         self.monitoring = True
 
         self.monitor_var.set(
-            "自動監視：稼働中"
+            "● 自動監視：稼働中"
         )
 
         self.status_var.set(
@@ -1693,19 +1918,38 @@ class StockWatcherApp:
         )
 
         window.geometry(
-            "800x500"
+            "850x550"
+        )
+
+        window.minsize(
+            650,
+            400
+        )
+
+        report_frame = ttk.Frame(
+            window,
+            padding=15
+        )
+
+        report_frame.pack(
+            fill="both",
+            expand=True
         )
 
         text = tk.Text(
-            window,
-            wrap="word"
+            report_frame,
+            wrap="word",
+            font=(
+                "Yu Gothic UI",
+                11
+            ),
+            padx=12,
+            pady=12
         )
 
         text.pack(
             fill="both",
-            expand=True,
-            padx=10,
-            pady=10
+            expand=True
         )
 
         text.insert(
@@ -1720,12 +1964,13 @@ class StockWatcherApp:
         ttk.Button(
             window,
             text="LINEへ送信",
+            style="Action.TButton",
             command=lambda:
             self.send_daily_report_to_line(
                 report
             )
         ).pack(
-            pady=(0, 10)
+            pady=(0, 15)
         )
 
     def send_daily_report_to_line(
@@ -1757,7 +2002,25 @@ class StockWatcherApp:
                 item
             )
 
-        for stock in self.db.get_stocks():
+        stocks = self.db.get_stocks()
+
+        for index, stock in enumerate(stocks):
+
+            if stock["profit"] > 0:
+
+                tag = "profit"
+
+            elif stock["profit"] < 0:
+
+                tag = "loss"
+
+            else:
+
+                tag = (
+                    "even"
+                    if index % 2 == 0
+                    else "odd"
+                )
 
             self.tree.insert(
 
@@ -1787,7 +2050,9 @@ class StockWatcherApp:
                         "T",
                         " "
                     ),
-                )
+                ),
+
+                tags=(tag,)
             )
 
 
