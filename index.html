@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>株AIアシスタント</title>
+
+<style>
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: "Segoe UI", "Noto Sans JP", sans-serif;
+    background: #f4f7fb;
+    color: #1f2937;
+}
+
+header {
+    background: #172033;
+    color: white;
+    padding: 20px;
+}
+
+.header-inner {
+    max-width: 1100px;
+    margin: auto;
+}
+
+header h1 {
+    margin: 0;
+    font-size: 24px;
+}
+
+header p {
+    margin: 6px 0 0;
+    color: #cbd5e1;
+}
+
+.container {
+    max-width: 1100px;
+    margin: 30px auto;
+    padding: 0 20px;
+}
+
+.card {
+    background: white;
+    border-radius: 16px;
+    padding: 22px;
+    margin-bottom: 20px;
+    box-shadow: 0 5px 20px rgba(0,0,0,0.06);
+}
+
+.card h2 {
+    margin-top: 0;
+}
+
+.form {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 15px;
+}
+
+label {
+    font-weight: bold;
+    font-size: 14px;
+}
+
+input {
+    width: 100%;
+    padding: 12px;
+    margin-top: 6px;
+    border: 1px solid #d1d5db;
+    border-radius: 10px;
+    font-size: 16px;
+}
+
+button {
+    border: none;
+    border-radius: 10px;
+    padding: 12px 18px;
+    font-size: 15px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.btn-primary {
+    background: #2563eb;
+    color: white;
+}
+
+.btn-primary:hover {
+    background: #1d4ed8;
+}
+
+.btn-danger {
+    background: #ef4444;
+    color: white;
+}
+
+.stock-list {
+    display: grid;
+    gap: 15px;
+}
+
+.stock {
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 18px;
+}
+
+.stock-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+}
+
+.stock-name {
+    font-size: 20px;
+    font-weight: bold;
+}
+
+.stock-code {
+    color: #64748b;
+    font-size: 14px;
+}
+
+.price {
+    font-size: 28px;
+    font-weight: bold;
+    margin: 12px 0;
+}
+
+.profit {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.positive {
+    color: #16a34a;
+}
+
+.negative {
+    color: #dc2626;
+}
+
+.neutral {
+    color: #64748b;
+}
+
+.ai-box {
+    margin-top: 15px;
+    padding: 15px;
+    border-radius: 12px;
+    background: #f8fafc;
+}
+
+.ai-title {
+    font-weight: bold;
+    margin-bottom: 8px;
+}
+
+.signal {
+    display: inline-block;
+    padding: 7px 14px;
+    border-radius: 999px;
+    font-weight: bold;
+}
+
+.buy {
+    background: #dcfce7;
+    color: #15803d;
+}
+
+.wait {
+    background: #fef3c7;
+    color: #a16207;
+}
+
+.sell {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+
+.empty {
+    text-align: center;
+    padding: 30px;
+    color: #64748b;
+}
+
+.notice {
+    background: #eff6ff;
+    color: #1d4ed8;
+    padding: 15px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+    line-height: 1.7;
+}
+
+@media (max-width: 700px) {
+    .form {
+        grid-template-columns: 1fr;
+    }
+
+    .stock-top {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    <div class="header-inner">
+        <h1>📈 株AIアシスタント</h1>
+        <p>株価・損益・AI判定をまとめて確認</p>
+    </div>
+</header>
+
+<div class="container">
+
+    <div class="notice">
+        現在は簡易株価データで動作するバージョンです。<br>
+        次の段階で楽天証券のリアルタイム情報との接続を行います。
+    </div>
+
+    <div class="card">
+        <h2>＋ 銘柄を登録</h2>
+
+        <div class="form">
+
+            <div>
+                <label>銘柄コード</label>
+                <input id="code" type="text" placeholder="例：6758">
+            </div>
+
+            <div>
+                <label>銘柄名</label>
+                <input id="name" type="text" placeholder="例：ソニーグループ">
+            </div>
+
+            <div>
+                <label>購入価格</label>
+                <input id="buyPrice" type="number" placeholder="例：3000">
+            </div>
+
+            <div>
+                <label>保有株数</label>
+                <input id="quantity" type="number" placeholder="例：100">
+            </div>
+
+        </div>
+
+        <br>
+
+        <button class="btn-primary" onclick="addStock()">
+            銘柄を登録
+        </button>
+    </div>
+
+    <div class="card">
+
+        <h2>📊 保有銘柄</h2>
+
+        <div id="stockList" class="stock-list"></div>
+
+    </div>
+
+</div>
+
+<script>
+
+const STORAGE_KEY = "stock_ai_data";
+
+let stocks = JSON.parse(
+    localStorage.getItem(STORAGE_KEY) || "[]"
+);
+
+
+/* =========================
+   デモ株価
+========================= */
+
+const demoPrices = {
+
+    "6758": 3500,
+    "7203": 2800,
+    "9984": 9500,
+    "8306": 4100,
+    "9432": 3200,
+    "7974": 8500,
+    "6501": 3900,
+    "6861": 62000
+
+};
+
+
+/* =========================
+   保存
+========================= */
+
+function saveStocks() {
+
+    localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify(stocks)
+    );
+
+}
+
+
+/* =========================
+   銘柄登録
+========================= */
+
+function addStock() {
+
+    const code =
+        document.getElementById("code").value.trim();
+
+    const name =
+        document.getElementById("name").value.trim();
+
+    const buyPrice =
+        Number(document.getElementById("buyPrice").value);
+
+    const quantity =
+        Number(document.getElementById("quantity").value);
+
+
+    if (!code || !name || !buyPrice || !quantity) {
+
+        alert("すべて入力してください。");
+
+        return;
+
+    }
+
+
+    const currentPrice =
+        demoPrices[code] ||
+        buyPrice;
+
+
+    const stock = {
+
+        id: Date.now(),
+
+        code: code,
+
+        name: name,
+
+        buyPrice: buyPrice,
+
+        quantity: quantity,
+
+        currentPrice: currentPrice
+
+    };
+
+
+    stocks.push(stock);
+
+    saveStocks();
+
+    renderStocks();
+
+
+    document.getElementById("code").value = "";
+
+    document.getElementById("name").value = "";
+
+    document.getElementById("buyPrice").value = "";
+
+    document.getElementById("quantity").value = "";
+
+}
+
+
+/* =========================
+   削除
+========================= */
+
+function deleteStock(id) {
+
+    stocks = stocks.filter(
+        stock => stock.id !== id
+    );
+
+    saveStocks();
+
+    renderStocks();
+
+}
+
+
+/* =========================
+   株価更新
+========================= */
+
+function updatePrices() {
+
+    stocks.forEach(stock => {
+
+        const base =
+            demoPrices[stock.code] ||
+            stock.currentPrice ||
+            stock.buyPrice;
+
+
+        /*
+         * デモ用として少しだけ
+         * 株価を変動させる
+         */
+
+        const change =
+            (Math.random() - 0.5) * 100;
+
+
+        stock.currentPrice =
+            Math.max(
+                1,
+                Math.round(base + change)
+            );
+
+    });
+
+
+    saveStocks();
+
+    renderStocks();
+
+}
+
+
+/* =========================
+   AI判定
+========================= */
+
+function getSignal(stock) {
+
+    const price =
+        stock.currentPrice;
+
+    const buy =
+        stock.buyPrice;
+
+
+    const difference =
+        ((price - buy) / buy) * 100;
+
+
+    if (difference <= -5) {
+
+        return {
+            text: "買い検討",
+            className: "buy",
+            reason: "購入価格より大きく下落しています。"
+        };
+
+    }
+
+
+    if (difference >= 10) {
+
+        return {
+            text: "売り検討",
+            className: "sell",
+            reason: "購入価格より大きく上昇しています。"
+        };
+
+    }
+
+
+    return {
+
+        text: "様子見",
+
+        className: "wait",
+
+        reason: "現在は大きな変動がないため様子見です。"
+
+    };
+
+}
+
+
+/* =========================
+   表示
+========================= */
+
+function renderStocks() {
+
+    const container =
+        document.getElementById("stockList");
+
+
+    if (stocks.length === 0) {
+
+        container.innerHTML = `
+            <div class="empty">
+                まだ銘柄が登録されていません。
+            </div>
+        `;
+
+        return;
+
+    }
+
+
+    container.innerHTML = "";
+
+
+    stocks.forEach(stock => {
+
+        const current =
+            stock.currentPrice;
+
+        const total =
+            (current - stock.buyPrice)
+            * stock.quantity;
+
+
+        const percent =
+            ((current - stock.buyPrice)
+            / stock.buyPrice)
+            * 100;
+
+
+        let profitClass =
+            "neutral";
+
+
+        if (total > 0) {
+
+            profitClass = "positive";
+
+        }
+
+        else if (total < 0) {
+
+            profitClass = "negative";
+
+        }
+
+
+        const signal =
+            getSignal(stock);
+
+
+        const div =
+            document.createElement("div");
+
+
+        div.className = "stock";
+
+
+        div.innerHTML = `
+
+            <div class="stock-top">
+
+                <div>
+
+                    <div class="stock-name">
+                        ${escapeHTML(stock.name)}
+                    </div>
+
+                    <div class="stock-code">
+                        ${escapeHTML(stock.code)}
+                    </div>
+
+                </div>
+
+                <button
+                    class="btn-danger"
+                    onclick="deleteStock(${stock.id})"
+                >
+                    削除
+                </button>
+
+            </div>
+
+
+            <div class="price">
+                ¥${current.toLocaleString()}
+            </div>
+
+
+            <div>
+
+                購入価格：
+                ¥${stock.buyPrice.toLocaleString()}
+
+                <br>
+
+                保有株数：
+                ${stock.quantity.toLocaleString()}株
+
+            </div>
+
+
+            <div class="profit ${profitClass}">
+
+                損益：
+                ${total >= 0 ? "+" : ""}
+                ¥${total.toLocaleString()}
+
+                (${percent >= 0 ? "+" : ""}
+                ${percent.toFixed(2)}%)
+
+            </div>
+
+
+            <div class="ai-box">
+
+                <div class="ai-title">
+                    🤖 AI判定
+                </div>
+
+                <span class="signal ${signal.className}">
+                    ${signal.text}
+                </span>
+
+                <p>
+                    ${signal.reason}
+                </p>
+
+            </div>
+
+        `;
+
+
+        container.appendChild(div);
+
+    });
+
+}
+
+
+/* =========================
+   HTML安全化
+========================= */
+
+function escapeHTML(value) {
+
+    return String(value)
+
+        .replaceAll("&", "&amp;")
+
+        .replaceAll("<", "&lt;")
+
+        .replaceAll(">", "&gt;")
+
+        .replaceAll('"', "&quot;")
+
+        .replaceAll("'", "&#039;");
+
+}
+
+
+/* =========================
+   初期表示
+========================= */
+
+renderStocks();
+
+</script>
+
+</body>
+</html>
